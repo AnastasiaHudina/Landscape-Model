@@ -63,6 +63,12 @@
     <ClInclude Include="tinyexr\deps\miniz\miniz.h">
       <Filter>Файлы заголовков</Filter>
     </ClInclude>
+    <ClInclude Include="stb_image.h">
+      <Filter>Файлы заголовков</Filter>
+    </ClInclude>
+    <ClInclude Include="IBL.h">
+      <Filter>Файлы заголовков</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="DirectX11App.cpp">
@@ -92,6 +98,9 @@
     <ClCompile Include="tinyexr\deps\miniz\miniz.c">
       <Filter>Исходные файлы</Filter>
     </ClCompile>
+    <ClCompile Include="IBL.cpp">
+      <Filter>Исходные файлы</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="DirectX11App.rc">
@@ -108,10 +117,16 @@
   </ItemGroup>
   <ItemGroup>
     <None Include="packages.config" />
-  </ItemGroup>
-  <ItemGroup>
-    <FxCompile Include="PBR.hlsl" />
-    <FxCompile Include="TerrainVS.hlsl" />
-    <FxCompile Include="TerrainPS.hlsl" />
+    <None Include="PBR.hlsl" />
+    <None Include="SkyboxPS.hlsl" />
+    <None Include="SkyboxVS.hlsl" />
+    <None Include="TerrainPS.hlsl" />
+    <None Include="TerrainVS.hlsl" />
+    <None Include="BRDFLUT_PS.hlsl" />
+    <None Include="FullscreenQuad_VS.hlsl" />
+    <None Include="HDRToCubeMap_PS.hlsl" />
+    <None Include="HDRToCubeMap_VS.hlsl" />
+    <None Include="IrradianceMap_PS.hlsl" />
+    <None Include="PrefilterEnvMap_PS.hlsl" />
   </ItemGroup>
 </Project>

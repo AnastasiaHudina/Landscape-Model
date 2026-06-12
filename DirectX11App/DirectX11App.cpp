@@ -35,6 +35,16 @@
 // Включаем заголовочные файлы для работы с текстурами и освещением
 #include "Texture.h"
 #include "Light.h"
+#include "IBL.h"
+
+// Skybox
+ID3D11VertexShader* g_pSkyboxVS = nullptr;
+ID3D11PixelShader* g_pSkyboxPS = nullptr;
+ID3D11InputLayout* g_pSkyboxInputLayout = nullptr;
+ID3D11Buffer* g_pSkyboxVertexBuffer = nullptr;
+ID3D11Buffer* g_pSkyboxIndexBuffer = nullptr;
+ID3D11Buffer* g_pSkyboxConstantBuffer = nullptr;
+UINT g_skyboxIndexCount = 0;
 
 #define TINYEXR_IMPLEMENTATION
 #include "tinyexr/tinyexr.h"
@@ -51,6 +61,14 @@ enum PostProcessEffect {
 };
 
 // === СТРУКТУРЫ ДЛЯ КОНСТАНТНЫХ БУФЕРОВ ===
+
+struct SkyboxConstants
+{
+    DirectX::XMMATRIX world;
+    DirectX::XMMATRIX viewProj;
+    DirectX::XMFLOAT4 cameraPosAndMode;
+};
+
 // Геометрический буфер для каждого объекта (матрица модели, матрица нормалей, параметры материала)
 struct GeomBuffer
 {
@@ -70,6 +88,9 @@ struct SceneBuffer
     DirectX::XMFLOAT4 ambientColor;          // цвет фонового (ambient) освещения
     DirectX::XMFLOAT4 flowInfo;               // x - использовать Flow 
     DirectX::XMFLOAT4 renderModeInfo; // x - renderMode, yzw - не используются (padding)
+    DirectX::XMFLOAT4 dirLightDir;    // направление света (x,y,z), w не используется
+    DirectX::XMFLOAT4 dirLightColor;  // цвет света (rgb) + интенсивность в w
+    //DirectX::XMFLOAT4 manualPBRParams; // для ручных PBR параметров: x - useManual (1.0), y - roughness, z - metalness, w - unused
 };
 
 // Буфер для постпроцессинга
@@ -117,10 +138,12 @@ ID3D11DeviceContext* m_pDeviceContext = nullptr;   // контекст устр�
 IDXGISwapChain* m_pSwapChain = nullptr;            // цепочка обмена (для отображения на экране)
 ID3D11RenderTargetView* m_pBackBufferRTV = nullptr; // представление заднего буфера как цели рендера
 
+IBL g_ibl;         // глобальный экземпляр
+
 // === ПЕРЕМЕННЫЕ ДЛЯ ОСВЕЩЕНИЯ ===
 Light m_lights[10];                                 // массив источников света
 DirectX::XMFLOAT4 m_ambientColor = { 0.1f, 0.1f, 0.2f, 1.0f }; // цвет фонового освещения
-int m_lightCount = 1;                               // количество активных источников
+int m_lightCount = 0;                               // количество активных источников
 bool m_useNormalMaps = true;                        // флаг использования карт нормалей
 bool m_showNormals = false;                          // флаг визуализации нормалей (для отладки)
 bool m_showLightBulbs = false;                        // показывать ли сферы-лампочки для источников
@@ -134,12 +157,17 @@ ID3D11ShaderResourceView* m_pDetailTextureView = nullptr; // шейдерное 
 
 // === ПЕРЕМЕННЫЕ ДЛЯ ТЕКСТУРЫ FLOW ===
 ID3D11ShaderResourceView* m_pFlowTextureView = nullptr;
-bool m_flowMode = true;   // false - режим без Flow, true - с Flow
+int m_flowModeIndex = 2;  // 0 – Обычный, 1 – Влажные ущелья, 2 – Каменистое дно, 3 – Горные ручьи
 
 // === ПЕРЕМЕННЫЕ ДЛЯ ТЕКСТУР PBR ===
 ID3D11ShaderResourceView* m_pRoughnessTextureView = nullptr; // шейдерное представление карты шероховатости
 ID3D11ShaderResourceView* m_pMetalnessTextureView = nullptr; // шейдерное представление карты металличности (пока константно)
 int g_renderMode = 0;           // 0 - обычный PBR, 1 - NDF, 2 - Geometry, 3 - Fresnel и т.д.
+
+// === Управление PBR параметрами ===
+//bool m_useManualRoughnessMetalness = false;  // флаг: true – ручные параметры
+//float m_manualRoughness = 0.5f;              // значение roughness (0..1)
+//float m_manualMetalness = 0.0f;              // значение metalness (0..1)
 
 // === ПЕРЕМЕННЫЕ ДЛЯ ПОСТПРОЦЕССИНГА ===
 ID3D11Texture2D* m_pColorBuffer = nullptr;           // текстура для промежуточного рендера (цвет)
@@ -199,9 +227,11 @@ ID3D11Buffer* m_pSceneBuffer = nullptr;               // константный 
 ID3D11Texture2D* m_pDepthBuffer = nullptr;            // текстура глубины
 ID3D11DepthStencilView* m_pDepthStencilView = nullptr; // представление глубины/трафарета
 ID3D11RasterizerState* m_pRasterizerState = nullptr;  // состояние растеризатора
+ID3D11RasterizerState* m_pRasterizerCullFront = nullptr;
 
 // === ПЕРЕМЕННЫЕ ДЛЯ СОСТОЯНИЙ ГЛУБИНЫ ===
 ID3D11DepthStencilState* m_pNormalDepthState = nullptr;     // Для непрозрачных объектов (reversed depth)
+ID3D11DepthStencilState* m_pSkyboxDepthState = nullptr;
 
 // === ПЕРЕМЕННЫЕ ДЛЯ BLEND STATES ===
 ID3D11BlendState* m_pOpaqueBlendState = nullptr;    // Для непрозрачных объектов (без смешивания)
@@ -211,6 +241,11 @@ ID3D11Texture2D* m_pTexture = nullptr;                // основная тек
 ID3D11ShaderResourceView* m_pTextureView = nullptr;   // шейдерное представление основной текстуры
 ID3D11SamplerState* m_pSampler = nullptr;             // сэмплер для текстурирования
 
+ID3D11SamplerState* g_pSkyboxSampler = nullptr;
+ID3D11SamplerState* g_pLinearSampler = nullptr;
+ID3D11SamplerState* g_pLinearMipSampler = nullptr;
+
+
 UINT m_width = 1280;                                  // ширина окна
 UINT m_height = 720;                                  // высота окна
 
@@ -219,8 +254,11 @@ UINT m_height = 720;                                  // высота окна
 DirectX::XMFLOAT3 m_camPos = { 0.0f, 0.0f, 0.0f };
 float m_yaw = 0.0f;          // горизонтальный угол (в радианах)
 float m_pitch = 0.0f;        // вертикальный угол
-float m_heightOffset = 1.0f; // расстояние над поверхностью
+float m_heightOffset = 2.0f; // расстояние над поверхностью
 std::vector<float> m_terrainHeights; // высоты ландшафта для интерполяции
+
+DirectX::XMFLOAT4X4 m_viewMatrix;
+DirectX::XMFLOAT4X4 m_projMatrix;
 
 bool m_rbPressed = false;                              // нажата ли правая кнопка мыши
 int m_prevMouseX = 0, m_prevMouseY = 0;                // предыдущие координаты мыши
@@ -264,10 +302,16 @@ bool InitShaders()
         if (pErrorBlob) OutputDebugStringA((const char*)pErrorBlob->GetBufferPointer());
         return false;
     }
-
     result = m_pDevice->CreateVertexShader(pVSBlob->GetBufferPointer(), pVSBlob->GetBufferSize(), nullptr, &m_pVertexShader);
     if (FAILED(result))
     {
+        pVSBlob->Release();
+        OutputDebugString(L"Ошибка создания TerrainVS\n");
+        return false;
+    }
+    // Проверка привязки вершинного шейдера
+    if (!m_pVertexShader) {
+        OutputDebugString(L"Не удается привязать TerrainVS к пайплайну\n");
         pVSBlob->Release();
         return false;
     }
@@ -280,11 +324,17 @@ bool InitShaders()
         pVSBlob->Release();
         return false;
     }
-
     result = m_pDevice->CreatePixelShader(pPSBlob->GetBufferPointer(), pPSBlob->GetBufferSize(), nullptr, &m_pPixelShader);
     if (FAILED(result))
     {
         pVSBlob->Release();
+        pPSBlob->Release();
+        OutputDebugString(L"Ошибка создания TerrainPS\n");
+        return false;
+    }
+    // Проверка привязки пиксельного шейдера
+    if (!m_pPixelShader) {
+        OutputDebugString(L"Не удается привязать TerrainPS к пайплайну\n");
         pPSBlob->Release();
         return false;
     }
@@ -303,6 +353,28 @@ bool InitShaders()
     pVSBlob->Release();
     pPSBlob->Release();
     if (pErrorBlob) pErrorBlob->Release();
+
+    // Проверка привязки Input Layout
+    if (!m_pInputLayout) {
+        OutputDebugString(L"Не удается привязать Input Layout к пайплайну\n");
+        return false;
+    }
+
+    // Привязка шейдеров и input layout к пайплайну
+    m_pDeviceContext->IASetInputLayout(m_pInputLayout);
+    m_pDeviceContext->VSSetShader(m_pVertexShader, nullptr, 0);
+    m_pDeviceContext->PSSetShader(m_pPixelShader, nullptr, 0);
+
+    // Проверка привязки шейдеров
+    ID3D11VertexShader* boundVS = nullptr;
+    ID3D11PixelShader* boundPS = nullptr;
+    m_pDeviceContext->VSGetShader(&boundVS, nullptr, nullptr);
+    m_pDeviceContext->PSGetShader(&boundPS, nullptr, nullptr);
+
+    if (boundVS != m_pVertexShader || boundPS != m_pPixelShader) {
+        OutputDebugString(L"Ошибка привязки шейдеров TerrainPS и TerrainVS к пайплайну\n");
+        return false;
+    }
 
     return SUCCEEDED(result);
 }
@@ -346,6 +418,47 @@ void CreateSphere(size_t latCells, size_t lonCells, UINT16* pIndices, DirectX::X
     }
 }
 
+// Создание сферы для скайбокса (все вершины на расстоянии 1 от центра)
+void CreateSkyboxSphere(UINT slices, UINT stacks, std::vector<float>& vertices, std::vector<UINT>& indices)
+{
+    vertices.clear();
+    indices.clear();
+
+    for (UINT stack = 0; stack <= stacks; ++stack)
+    {
+        float phi = (float)stack / (float)stacks * DirectX::XM_PI;          // 0..PI
+        float y = cosf(phi);
+        float r = sinf(phi);
+
+        for (UINT slice = 0; slice <= slices; ++slice)
+        {
+            float theta = (float)slice / (float)slices * DirectX::XM_2PI;   // 0..2PI
+            float x = r * cosf(theta);
+            float z = r * sinf(theta);
+            vertices.push_back(x);
+            vertices.push_back(y);
+            vertices.push_back(z);
+        }
+    }
+
+    for (UINT stack = 0; stack < stacks; ++stack)
+    {
+        for (UINT slice = 0; slice < slices; ++slice)
+        {
+            UINT i0 = stack * (slices + 1) + slice;
+            UINT i1 = (stack + 1) * (slices + 1) + slice;
+            UINT i2 = (stack + 1) * (slices + 1) + slice + 1;
+            UINT i3 = stack * (slices + 1) + slice + 1;
+
+            indices.push_back(i0);
+            indices.push_back(i2);
+            indices.push_back(i1);
+            indices.push_back(i0);
+            indices.push_back(i3);
+            indices.push_back(i2);
+        }
+    }
+}
 
 // === ФУНКЦИИ ЗАГРУЗКИ ТЕКСТУР И КАРТЫ НОРМАЛЕЙ ИЗ DDS и PNG ===
 
@@ -675,7 +788,7 @@ bool LoadRoughnessTexture()
     HRESULT result = S_OK;
 
     TextureDesc textureDesc;
-    if (!LoadPNG(L"landscape/Terrain003_4K_Flow.png", textureDesc))   // имя файла
+    if (!LoadPNG(L"landscape/Terrain003_4K_Protrusion.png", textureDesc))   // имя файла
         return false;
 
     // Проверка поддержки формата (линейный RGBA)
@@ -1224,6 +1337,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     ImGui::StyleColorsDark();
 
+    // Загружаем шрифт с кириллицей (можно указать другой путь к .ttf)
+    ImFont* font = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\Calibri.ttf", 14.0f, NULL, io.Fonts->GetGlyphRangesCyrillic());
+    if (!font)
+    {
+        // Если шрифт не загрузился - используем стандартный (без кириллицы)
+        io.Fonts->AddFontDefault();
+    }
+
     // Инициализация ImGui для Win32 и DirectX11
     ImGui_ImplWin32_Init(g_hWnd);
     ImGui_ImplDX11_Init(m_pDevice, m_pDeviceContext);
@@ -1316,14 +1437,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     }
 
     // Инициализация источников света
-    m_lightCount = 1;
+    m_lightCount = 0;
     // Основной источник
     m_lights[0].pos = DirectX::XMFLOAT4(-5.0f, 6.9f, -1.0f, 1.0f);
     m_lights[0].color = DirectX::XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f); // белый цвет
     m_lights[0].padding[0] = m_lights[0].padding[1] = m_lights[0].padding[2] = 0.0f;
     // Эмбиент
     //m_ambientColor = DirectX::XMFLOAT4(0.3f, 0.3f, 0.4f, 1.0f); // светлый ambient
-    m_ambientColor = DirectX::XMFLOAT4(0.0f, 0.0f, 0.2f, 1.0f); //темный эмбиент, чтобы видеть источники
+    m_ambientColor = DirectX::XMFLOAT4(0.05f, 0.05f, 0.1f, 1.0f); //темный эмбиент, чтобы видеть источники
     //m_ambientColor = DirectX::XMFLOAT4(1.0f, 1.0f, 1.1f, 1.0f); //светлый эмбиент
     UpdateLightIntensities();  // установит intensity в зависимости от текущего m_flowMode
 
@@ -1344,6 +1465,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         else
         {
             // Если нет сообщений, рендерим кадр
+            g_ibl.Update();   // генерирует по одному шагу за кадр
             Render();
         }
     }
@@ -1610,18 +1732,32 @@ bool InitDirectX()
     result = m_pDevice->CreateRasterizerState(&rasterDesc, &m_pRasterizerState);
     if (FAILED(result)) return false;
 
+    // РАСТЕРРАЙЗЕР ДЛЯ СКАЙБОКСА
+    rasterDesc.CullMode = D3D11_CULL_FRONT;   // отсекаем передние грани
+    result = m_pDevice->CreateRasterizerState(&rasterDesc, &m_pRasterizerCullFront);
+    if (FAILED(result)) return false;
+
     // === СОЗДАНИЕ СОСТОЯНИЙ ГЛУБИНЫ ДЛЯ REVERSED DEPTH ===
 
     // Для непрозрачных объектов - reversed depth
     D3D11_DEPTH_STENCIL_DESC opaqueDepthDesc = {};
     opaqueDepthDesc.DepthEnable = TRUE;
     opaqueDepthDesc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
-    opaqueDepthDesc.DepthFunc = D3D11_COMPARISON_GREATER;  // REVERSED DEPTH: ближние объекты имеют большие значения глубины
+    opaqueDepthDesc.DepthFunc = D3D11_COMPARISON_LESS;  // REVERSED DEPTH: ближние объекты имеют большие значения глубины
     opaqueDepthDesc.StencilEnable = FALSE;
 
     result = m_pDevice->CreateDepthStencilState(&opaqueDepthDesc, &m_pNormalDepthState);
     if (FAILED(result)) return false;
 
+    // Depth-stencil state для скайбокса (тест включён, запись выключена, сравнение LESS_EQUAL)
+    D3D11_DEPTH_STENCIL_DESC skyboxDepthDesc = {};
+    skyboxDepthDesc.DepthEnable = TRUE;
+    skyboxDepthDesc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;   // не пишем в глубину
+    skyboxDepthDesc.DepthFunc = D3D11_COMPARISON_LESS_EQUAL;        // отображаем, даже если глубина равна
+    skyboxDepthDesc.StencilEnable = FALSE;
+
+    result = m_pDevice->CreateDepthStencilState(&skyboxDepthDesc, &m_pSkyboxDepthState);
+    if (FAILED(result)) return false;
 
     // === СОЗДАНИЕ BLEND STATES ===
     D3D11_BLEND_DESC blendDesc = {};
@@ -1632,6 +1768,181 @@ bool InitDirectX()
 
     result = m_pDevice->CreateBlendState(&blendDesc, &m_pOpaqueBlendState);
     if (FAILED(result)) return false;
+
+    // === СОЗДАНИЕ СЭМПЛЕРОВ ДЛЯ СКАЙБОКСА И IBL ===
+
+    // Сэмплер для скайбокса (Clamp, линейная фильтрация)
+    D3D11_SAMPLER_DESC skyboxSampDesc = {};
+    skyboxSampDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    //skyboxSampDesc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+    skyboxSampDesc.AddressU = D3D11_TEXTURE_ADDRESS_WRAP;
+    skyboxSampDesc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+    skyboxSampDesc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    skyboxSampDesc.MinLOD = -FLT_MAX;
+    skyboxSampDesc.MaxLOD = FLT_MAX;
+    skyboxSampDesc.MipLODBias = 0.0f;
+    skyboxSampDesc.MaxAnisotropy = 1;
+    skyboxSampDesc.ComparisonFunc = D3D11_COMPARISON_NEVER;
+
+    result = m_pDevice->CreateSamplerState(&skyboxSampDesc, &g_pSkyboxSampler);
+    if (FAILED(result)) return false;
+
+    // Сэмплер для IBL (диффузная irradiance – линейная, clamp)
+    D3D11_SAMPLER_DESC linearSampDesc = {};
+    linearSampDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    linearSampDesc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+    linearSampDesc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+    linearSampDesc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    linearSampDesc.MinLOD = -FLT_MAX;
+    linearSampDesc.MaxLOD = 0;
+    //linearSampDesc.MaxLOD = FLT_MAX;
+    linearSampDesc.MipLODBias = 0.0f;
+    linearSampDesc.MaxAnisotropy = 1;
+    linearSampDesc.ComparisonFunc = D3D11_COMPARISON_NEVER;
+
+    result = m_pDevice->CreateSamplerState(&linearSampDesc, &g_pLinearSampler);
+    if (FAILED(result)) return false;
+
+    // Сэмплер для prefiltered env map (с полной поддержкой mip-уровней)
+    D3D11_SAMPLER_DESC linearMipSampDesc = {};
+    linearMipSampDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    linearMipSampDesc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+    linearMipSampDesc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+    linearMipSampDesc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    linearMipSampDesc.MinLOD = -FLT_MAX;
+    linearMipSampDesc.MaxLOD = D3D11_FLOAT32_MAX;   // ключевая строка!
+    linearMipSampDesc.MipLODBias = 0.0f;
+    linearMipSampDesc.MaxAnisotropy = 1;
+    linearMipSampDesc.ComparisonFunc = D3D11_COMPARISON_NEVER;
+
+    result = m_pDevice->CreateSamplerState(&linearMipSampDesc, &g_pLinearMipSampler);
+    if (FAILED(result)) return false;
+
+    // Инициализация IBL (HDR окружение)
+    if (!g_ibl.Init(m_pDevice, m_pDeviceContext))
+    {
+        OutputDebugString(L"IBL::Init failed\n");
+        return false;
+    }
+
+    // Инициализация скайбокса
+    {
+        std::vector<float> skyboxVertices;
+        std::vector<UINT> skyboxIndices;
+        CreateSkyboxSphere(64, 32, skyboxVertices, skyboxIndices);  // 64x32 – достаточно для плавного отображения
+
+        g_skyboxIndexCount = (UINT)skyboxIndices.size();
+
+        D3D11_BUFFER_DESC vbDesc = {};
+        vbDesc.ByteWidth = (UINT)(skyboxVertices.size() * sizeof(float));
+        vbDesc.Usage = D3D11_USAGE_IMMUTABLE;
+        vbDesc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+        D3D11_SUBRESOURCE_DATA vbData = { skyboxVertices.data(), 0, 0 };
+        HRESULT hr = m_pDevice->CreateBuffer(&vbDesc, &vbData, &g_pSkyboxVertexBuffer);
+        if (FAILED(hr)) return false;
+
+        D3D11_BUFFER_DESC ibDesc = {};
+        ibDesc.ByteWidth = (UINT)(skyboxIndices.size() * sizeof(UINT));
+        ibDesc.Usage = D3D11_USAGE_IMMUTABLE;
+        ibDesc.BindFlags = D3D11_BIND_INDEX_BUFFER;
+        D3D11_SUBRESOURCE_DATA ibData = { skyboxIndices.data(), 0, 0 };
+        hr = m_pDevice->CreateBuffer(&ibDesc, &ibData, &g_pSkyboxIndexBuffer);
+        if (FAILED(hr)) return false;
+
+        // Константный буфер
+        D3D11_BUFFER_DESC cbDesc = {};
+        cbDesc.ByteWidth = sizeof(SkyboxConstants);
+        cbDesc.Usage = D3D11_USAGE_DYNAMIC;
+        cbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        cbDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        hr = m_pDevice->CreateBuffer(&cbDesc, nullptr, &g_pSkyboxConstantBuffer);
+        if (FAILED(hr)) return false;
+    }
+
+    // Компиляция шейдеров скайбокса (SkyboxVS.hlsl и SkyboxPS.hlsl)
+    ID3DBlob* pSkyboxVSBlob = nullptr;
+    ID3DBlob* pSkyboxPSBlob = nullptr;
+    UINT flags = D3DCOMPILE_ENABLE_STRICTNESS;
+#ifdef _DEBUG
+    flags |= D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
+#endif
+
+    result = D3DCompileFromFile(L"SkyboxVS.hlsl", nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE,
+        "main", "vs_5_0", flags, 0, &pSkyboxVSBlob, nullptr);
+    if (FAILED(result))
+    {
+        OutputDebugString(L"Ошибка компиляции SkyboxVS.hlsl\n");
+        return false;
+    }
+    result = m_pDevice->CreateVertexShader(pSkyboxVSBlob->GetBufferPointer(),
+        pSkyboxVSBlob->GetBufferSize(), nullptr, &g_pSkyboxVS);
+    if (FAILED(result)) {
+        OutputDebugString(L"Ошибка создания Vertex Shader\n");
+        pSkyboxVSBlob->Release();
+        return false;
+    }
+    // Проверка привязки шейдера
+    if (!g_pSkyboxVS) {
+        OutputDebugString(L"Не удается привязать Skybox Vertex Shader к пайплайну\n");
+        return false;
+    }
+
+    result = D3DCompileFromFile(L"SkyboxPS.hlsl", nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE,
+        "main", "ps_5_0", flags, 0, &pSkyboxPSBlob, nullptr);
+    if (FAILED(result))
+    {
+        OutputDebugString(L"Ошибка компиляции SkyboxPS.hlsl\n");
+        pSkyboxVSBlob->Release();
+        return false;
+    }
+    result = m_pDevice->CreatePixelShader(pSkyboxPSBlob->GetBufferPointer(),
+        pSkyboxPSBlob->GetBufferSize(), nullptr, &g_pSkyboxPS);
+    if (FAILED(result)) {
+        OutputDebugString(L"Ошибка создания Pixel Shader\n");
+        pSkyboxVSBlob->Release();
+        pSkyboxPSBlob->Release();
+        return false;
+    }
+    // Проверка привязки пиксельного шейдера
+    if (!g_pSkyboxPS) {
+        OutputDebugString(L"Не удается привязать Skybox Pixel Shader к пайплайну\n");
+        pSkyboxPSBlob->Release();
+        return false;
+    }
+
+    // Input layout: только позиция (3 float)
+    D3D11_INPUT_ELEMENT_DESC layoutDesc = { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT,
+        0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0 };
+    result = m_pDevice->CreateInputLayout(&layoutDesc, 1,
+        pSkyboxVSBlob->GetBufferPointer(), pSkyboxVSBlob->GetBufferSize(),
+        &g_pSkyboxInputLayout);
+    pSkyboxVSBlob->Release();
+    pSkyboxPSBlob->Release();
+    if (FAILED(result)) {
+        OutputDebugString(L"Ошибка создания Input Layout\n");
+        return false;
+    }
+    // Проверка привязки input layout
+    if (!g_pSkyboxInputLayout) {
+        OutputDebugString(L"Не удается привязать Input Layout к пайплайну\n");
+        return false;
+    }
+
+    // Привязка шейдеров и input layout к пайплайну
+    m_pDeviceContext->IASetInputLayout(g_pSkyboxInputLayout);
+    m_pDeviceContext->VSSetShader(g_pSkyboxVS, nullptr, 0);
+    m_pDeviceContext->PSSetShader(g_pSkyboxPS, nullptr, 0);
+
+    // Проверка привязки шейдеров
+    ID3D11VertexShader* boundVS = nullptr;
+    ID3D11PixelShader* boundPS = nullptr;
+    m_pDeviceContext->VSGetShader(&boundVS, nullptr, nullptr);
+    m_pDeviceContext->PSGetShader(&boundPS, nullptr, nullptr);
+
+    if (boundVS != g_pSkyboxVS || boundPS != g_pSkyboxPS) {
+        OutputDebugString(L"Ошибка привязки шейдеров SkyboxVS и SkyboxPS к пайплайну\n");
+        return false;
+    }
 
     return SUCCEEDED(result);
 }
@@ -1707,6 +2018,9 @@ bool InitColorBuffer()
     colorBufferDesc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
     colorBufferDesc.CPUAccessFlags = 0;
     colorBufferDesc.MiscFlags = 0;
+
+    colorBufferDesc.SampleDesc.Count = 1;
+    colorBufferDesc.SampleDesc.Quality = 0;
 
     result = m_pDevice->CreateTexture2D(&colorBufferDesc, nullptr, &m_pColorBuffer);
     if (FAILED(result)) return false;
@@ -2090,7 +2404,13 @@ void UpdateCamera()
     float aspectRatio = (float)m_width / m_height;
     float halfW = tanf(fov / 2) * f;
     float halfH = halfW / aspectRatio;
-    DirectX::XMMATRIX proj = DirectX::XMMatrixPerspectiveLH(halfW * 2.0f, halfH * 2.0f, f, n);
+   //DirectX::XMMATRIX proj = DirectX::XMMatrixPerspectiveLH(halfW * 2.0f, halfH * 2.0f, f, n);
+    DirectX::XMMATRIX proj = DirectX::XMMatrixPerspectiveFovLH(fov, aspectRatio, n, f);
+
+    // Сохраняем матрицы для скайбокса
+    DirectX::XMStoreFloat4x4(&m_viewMatrix, view);
+    DirectX::XMStoreFloat4x4(&m_projMatrix, proj);
+    
     DirectX::XMMATRIX vp = DirectX::XMMatrixMultiply(view, proj);
 
     // Заполнение константного буфера сцены
@@ -2109,10 +2429,22 @@ void UpdateCamera()
 
     sceneBuffer.ambientColor = m_ambientColor;
     float flowStrength = 0.0f; // например, 0.5 – половина силы
-    sceneBuffer.flowInfo = DirectX::XMFLOAT4(m_flowMode ? 1.0f : 0.0f, flowStrength, 0.0f, 0.0f);
+    sceneBuffer.flowInfo = DirectX::XMFLOAT4((float)m_flowModeIndex, 0.0f, 0.0f, 0.0f);
     //sceneBuffer.flowInfo = DirectX::XMFLOAT4(m_flowMode ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f);
 
     sceneBuffer.renderModeInfo = DirectX::XMFLOAT4((float)g_renderMode, 0.0f, 0.0f, 0.0f);
+
+    // Направленный свет – берём направление из IBL (если готово), иначе fallback
+    DirectX::XMFLOAT3 sunDir = g_ibl.GetSunDirection();
+    sceneBuffer.dirLightDir = DirectX::XMFLOAT4(sunDir.x, sunDir.y, sunDir.z, 0.0f);
+    // Интенсивность и цвет подберите под свою сцену (для луны – холодный, яркость 1.5..2.0)
+    sceneBuffer.dirLightColor = DirectX::XMFLOAT4(0.9f, 0.95f, 1.0f, 1.5f);
+
+    // ручное управление шероховатостью/металличностью
+    //sceneBuffer.manualPBRParams.x = m_useManualRoughnessMetalness ? 1.0f : 0.0f;
+    //sceneBuffer.manualPBRParams.y = m_manualRoughness;
+    //sceneBuffer.manualPBRParams.z = m_manualMetalness;
+    //sceneBuffer.manualPBRParams.w = 0.0f;
 
     // Обновление буфера
     D3D11_MAPPED_SUBRESOURCE mapped;
@@ -2159,6 +2491,10 @@ void RenderPostProcess()
     ID3D11SamplerState* samplers[] = { m_pSampler };
     m_pDeviceContext->PSSetSamplers(0, 1, samplers);
 
+    // Устанавливаем сэмплеры для IBL (слоты 1 и 2)
+    //ID3D11SamplerState* iblSamplers[] = { g_pLinearSampler, g_pLinearMipSampler };
+    //m_pDeviceContext->PSSetSamplers(1, 2, iblSamplers);
+
     // Устанавливаем текстуру (промежуточный буфер цвета) как шейдерный ресурс
     ID3D11ShaderResourceView* resources[] = { m_pColorBufferSRV };
     m_pDeviceContext->PSSetShaderResources(0, 1, resources);
@@ -2173,6 +2509,16 @@ void RenderPostProcess()
     // Устанавливаем константный буфер постпроцессинга
     ID3D11Buffer* postProcessConstantBuffers[] = { m_pPostProcessBuffer };
     m_pDeviceContext->PSSetConstantBuffers(0, 1, postProcessConstantBuffers);
+
+    // Устанавливаем viewport на весь экран
+    D3D11_VIEWPORT vp = {};
+    vp.TopLeftX = 0.0f;
+    vp.TopLeftY = 0.0f;
+    vp.Width = (FLOAT)m_width;
+    vp.Height = (FLOAT)m_height;
+    vp.MinDepth = 0.0f;
+    vp.MaxDepth = 1.0f;
+    m_pDeviceContext->RSSetViewports(1, &vp);
 
     // Рисуем 3 вершины (один треугольник, покрывающий экран)
     m_pDeviceContext->Draw(3, 0);
@@ -2280,12 +2626,12 @@ void UpdateLightIntensities()
     // Основной источник (индекс 0)
     if (m_lightCount > 0)
     {
-        m_lights[0].intensity = m_flowMode ? 100.0f : 80.0f;
+        m_lights[0].intensity = (m_flowModeIndex > 0) ? 100.0f : 80.0f;
     }
     // Остальные источники (индексы 1..m_lightCount-1)
     for (int i = 1; i < m_lightCount; i++)
     {
-        m_lights[i].intensity = m_flowMode ? 20.0f : 10.0f;
+        m_lights[i].intensity = (m_flowModeIndex > 0) ? 20.0f : 10.0f;
     }
 }
 
@@ -2303,9 +2649,14 @@ void Render()
     if (g_deltaTime > 0.1f) g_deltaTime = 0.1f;
     g_prevTime = currentTime;
 
+    g_ibl.Update();   // если ещё не добавили выше
+    const IBLResources& iblRes = g_ibl.GetResources();
+
     // Сбрасываем шейдерные ресурсы перед началом (на всякий случай)
-    ID3D11ShaderResourceView* nullSRVs[3] = { nullptr, nullptr, nullptr };
-    m_pDeviceContext->PSSetShaderResources(0, 3, nullSRVs);
+    ID3D11ShaderResourceView* nullSRVs[16] = {};
+    m_pDeviceContext->PSSetShaderResources(0, 16, nullSRVs);
+    //ID3D11ShaderResourceView* nullSRV = nullptr;
+    //m_pDeviceContext->PSSetShaderResources(0, 1, &nullSRV);
 
     // Рендерим сцену в промежуточную текстуру для постпроцессинга
     ID3D11RenderTargetView* views[] = { m_pColorBufferRTV };
@@ -2316,7 +2667,8 @@ void Render()
     m_pDeviceContext->ClearRenderTargetView(m_pColorBufferRTV, BackColor);
     if (m_pDepthStencilView)
         // Для reversed depth очищаем глубину на 0.0 (дальняя плоскость)
-        m_pDeviceContext->ClearDepthStencilView(m_pDepthStencilView, D3D11_CLEAR_DEPTH, 0.0f, 0);
+        //m_pDeviceContext->ClearDepthStencilView(m_pDepthStencilView, D3D11_CLEAR_DEPTH, 0.0f, 0);
+        m_pDeviceContext->ClearDepthStencilView(m_pDepthStencilView, D3D11_CLEAR_DEPTH, 1.0f, 0);
 
     // Устанавливаем viewport
     D3D11_VIEWPORT viewport = {};
@@ -2335,7 +2687,95 @@ void Render()
     UpdateCamera();
     UpdatePostProcessBuffer();
    
-    // 1. РЕНДЕРИМ ЛАНДШАФТ
+    // 1. РЕНДЕРИМ СКАЙБОКС (ДО ЛАНДШАФТА)
+    // if (iblRes.skyboxSRV)
+    if (g_ibl.IsReady() && iblRes.skyboxSRV)
+    {
+        // Сохраняем текущие состояния
+        ID3D11RenderTargetView* pOldRTV = nullptr;
+        ID3D11DepthStencilView* pOldDSV = nullptr;
+        m_pDeviceContext->OMGetRenderTargets(1, &pOldRTV, &pOldDSV);
+
+        ID3D11RasterizerState* pOldRS = nullptr;
+        m_pDeviceContext->RSGetState(&pOldRS);
+
+        // Depth-стейт для скайбокса (уже создан в InitDirectX)
+        m_pDeviceContext->OMSetDepthStencilState(m_pSkyboxDepthState, 0);
+
+        // Устанавливаем render target (тот же, что и для ландшафта)
+        m_pDeviceContext->OMSetRenderTargets(1, &m_pColorBufferRTV, m_pDepthStencilView);
+
+        // Устанавливаем растеризатор без отсечения граней (можно использовать m_pRasterizerState)
+        m_pDeviceContext->RSSetState(m_pRasterizerState);
+
+        // Матрица вида-проекции для скайбокса (без переноса камеры)
+        // Загружаем матрицы
+        DirectX::XMMATRIX view = DirectX::XMLoadFloat4x4(&m_viewMatrix);
+        DirectX::XMMATRIX proj = DirectX::XMLoadFloat4x4(&m_projMatrix);
+
+        // Убираем перенос (трансляцию) из матрицы вида
+        DirectX::XMMATRIX viewNoTranslation = view;
+        viewNoTranslation.r[3] = DirectX::XMVectorSet(0, 0, 0, 1); // обнуляем последнюю строку
+
+        // Вычисляем матрицу вида-проекции для скайбокса
+        DirectX::XMMATRIX vpSky = viewNoTranslation * proj;
+
+        // Константный буфер для скайбокса
+        struct SkyboxConstants
+        {
+            DirectX::XMMATRIX world;
+            DirectX::XMMATRIX viewProj;
+            DirectX::XMFLOAT4 cameraPosAndMode;
+        };
+        SkyboxConstants skyboxCB;
+        skyboxCB.world = DirectX::XMMatrixIdentity();
+        skyboxCB.viewProj = DirectX::XMMatrixTranspose(vpSky);
+        skyboxCB.cameraPosAndMode = DirectX::XMFLOAT4(m_camPos.x, m_camPos.y, m_camPos.z, 0.0f);
+
+        D3D11_MAPPED_SUBRESOURCE mapped;
+        if (SUCCEEDED(m_pDeviceContext->Map(g_pSkyboxConstantBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+        {
+            memcpy(mapped.pData, &skyboxCB, sizeof(SkyboxConstants));
+            m_pDeviceContext->Unmap(g_pSkyboxConstantBuffer, 0);
+        }
+
+        // Устанавливаем константные буферы
+        ID3D11Buffer* skyboxCBs[] = { g_pSkyboxConstantBuffer, g_pSkyboxConstantBuffer };
+        m_pDeviceContext->VSSetConstantBuffers(0, 2, skyboxCBs);
+
+        // Устанавливаем текстуру скайбокса и сэмплер
+        m_pDeviceContext->PSSetShaderResources(9, 1, &iblRes.skyboxSRV);  // Используется skyboxSRV
+        m_pDeviceContext->PSSetSamplers(0, 1, &g_pSkyboxSampler);
+
+        // Настройка вершинных буферов
+        UINT stride = sizeof(float) * 3;
+        UINT offset = 0;
+        m_pDeviceContext->IASetVertexBuffers(0, 1, &g_pSkyboxVertexBuffer, &stride, &offset);
+        m_pDeviceContext->IASetIndexBuffer(g_pSkyboxIndexBuffer, DXGI_FORMAT_R32_UINT, 0);
+        m_pDeviceContext->IASetInputLayout(g_pSkyboxInputLayout);
+        m_pDeviceContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+        m_pDeviceContext->VSSetShader(g_pSkyboxVS, nullptr, 0);
+        m_pDeviceContext->PSSetShader(g_pSkyboxPS, nullptr, 0);
+
+        // ПЕРЕКЛЮЧАЕМ РАСТЕРРАЙЗЕР
+        m_pDeviceContext->RSSetState(m_pRasterizerCullFront);
+
+        m_pDeviceContext->DrawIndexed(g_skyboxIndexCount, 0, 0);
+
+        // ВОЗВРАЩАЕМ ОБЫЧНЫЙ РАСТЕРРАЙЗЕР
+        m_pDeviceContext->RSSetState(m_pRasterizerState);
+
+        // Восстановление состояний
+        m_pDeviceContext->RSSetState(pOldRS);
+        m_pDeviceContext->OMSetRenderTargets(1, &pOldRTV, pOldDSV);
+
+        if (pOldRTV) pOldRTV->Release();
+        if (pOldDSV) pOldDSV->Release();
+        if (pOldRS) pOldRS->Release();
+    }
+
+    // 2. РЕНДЕРИМ ЛАНДШАФТ
     m_pDeviceContext->OMSetDepthStencilState(m_pNormalDepthState, 0);
     m_pDeviceContext->OMSetBlendState(m_pOpaqueBlendState, nullptr, 0xFFFFFFFF);
 
@@ -2349,6 +2789,41 @@ void Render()
         m_pMetalnessTextureView  // пока nullptr, но слот зарезервирован
     };
     m_pDeviceContext->PSSetShaderResources(0, 6, terrainResources);
+
+    // Устанавливаем IBL текстуры 
+    if (g_ibl.IsReady()) // чтобы не биндить IBL текстуры до завершения pipline
+    {
+        ID3D11ShaderResourceView* iblResources[] = {
+            iblRes.irradianceSRV,
+            iblRes.prefilteredSRV,
+            iblRes.brdfLUTSRV
+        };
+        m_pDeviceContext->PSSetShaderResources(6, 3, iblResources);
+    }
+    else
+    {
+        ID3D11ShaderResourceView* nullIBL[3] = {};
+        m_pDeviceContext->PSSetShaderResources(6, 3, nullIBL);
+    }
+    /*
+    ID3D11ShaderResourceView* iblResources[] = {
+    iblRes.irradianceSRV,
+    iblRes.prefilteredSRV,
+    iblRes.brdfLUTSRV
+    };
+    m_pDeviceContext->PSSetShaderResources(6, 3, iblResources);
+    */
+
+    // Устанавливаем сэмплер для основной текстуры (slot 0)
+    ID3D11SamplerState* mainSampler = m_pSampler;
+    m_pDeviceContext->PSSetSamplers(0, 1, &mainSampler);
+
+    // Устанавливаем сэмплеры: s0 - основной (уже есть), s1 - linearSampler, s2 - linearMipSampler
+    ID3D11SamplerState* samplersIBL[] = {
+        g_pLinearSampler,     // s1
+        g_pLinearMipSampler   // s2
+    };
+    m_pDeviceContext->PSSetSamplers(1, 2, samplersIBL);
 
     // Настраиваем пайплайн
     ID3D11Buffer* vertexBuffers[] = { m_pTerrainVertexBuffer };
@@ -2373,13 +2848,10 @@ void Render()
     // Рисуем ландшафт
     m_pDeviceContext->DrawIndexed(m_terrainIndexCount, 0, 0);
 
-    // 2. РЕНДЕРИМ МАЛЕНЬКИЕ СФЕРЫ (ИСТОЧНИКИ СВЕТА)
-    RenderSmallSpheres();
-
-    // Применяем постпроцессинг (рисуем на заднем буфере с эффектом)
+    // 3. Применяем постпроцессинг (рисуем на заднем буфере с эффектом)
     RenderPostProcess();
 
-    // 5. РЕНДЕРИМ ImGui (поверх всего)
+    // 4. РЕНДЕРИМ ImGui (поверх всего)
     if (m_showImGui)
     {
         // Начало нового кадра ImGui
@@ -2387,95 +2859,88 @@ void Render()
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
 
-        // Окно управления освещением
-        ImGui::Begin("Lights control", &m_showImGui, ImGuiWindowFlags_AlwaysAutoResize);
+        // Единое окно управления
+        ImGui::Begin("Control Panel", &m_showImGui, ImGuiWindowFlags_AlwaysAutoResize);
 
-        ImGui::Checkbox("Show bulbs", &m_showLightBulbs); //Показывать источники света
-        ImGui::Checkbox("Use normal maps", &m_useNormalMaps); //Использовать карты нормалей
-        ImGui::Checkbox("Show normals", &m_showNormals); //Показывать нормали
-
-        // Кнопки для добавления/удаления источников света
-        if (ImGui::Button("Add bulb") && m_lightCount < 10) //Добавить источник
+        // Секция постпроцессинга
+        if (ImGui::CollapsingHeader("Post Processing", ImGuiTreeNodeFlags_DefaultOpen))
         {
-            m_lightCount++;
-            // Инициализируем новый источник
-            m_lights[m_lightCount - 1].pos = DirectX::XMFLOAT4(6.0f, 5.0f, 0.0f, 1.0f);
-            m_lights[m_lightCount - 1].color = DirectX::XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f);
-            m_lights[m_lightCount - 1].padding[0] = m_lights[m_lightCount - 1].padding[1] = m_lights[m_lightCount - 1].padding[2] = 0.0f;
-            UpdateLightIntensities(); // пересчитать все интенсивности
+            const char* effectNames[] = {
+                "No Effect",     // 0
+                "Sepia",         // 1
+                "Cold Tint",     // 2
+                "Night Vision"   // 3
+            };
+
+            ImGui::Text("Post-Process Effect:");
+            ImGui::Combo("Effect", &m_postProcessEffect, effectNames, IM_ARRAYSIZE(effectNames));
+
+            // Отображение текущего выбранного эффекта
+            ImGui::Text("Current Effect:");
+            ImGui::SameLine();
+            switch (m_postProcessEffect)
+            {
+            case 0: ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "None"); break;
+            case 1: ImGui::TextColored(ImVec4(0.8f, 0.6f, 0.2f, 1.0f), "Sepia"); break;
+            case 2: ImGui::TextColored(ImVec4(0.2f, 0.6f, 1.0f, 1.0f), "Cold Tint"); break;
+            case 3: ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.3f, 1.0f), "Night Vision"); break;
+            }
         }
-        ImGui::SameLine();
-        if (ImGui::Button("Delete bulb") && m_lightCount > 0) //Удалить источник
+
+        // Секция освещения
+        if (ImGui::CollapsingHeader("Lights", ImGuiTreeNodeFlags_DefaultOpen))
         {
-            m_lightCount--;
+            ImGui::Checkbox("Use normal maps", &m_useNormalMaps); // Использовать карты нормалей
+            //ImGui::ColorEdit3("Ambient light", &m_ambientColor.x); // Окружающий цвет
         }
 
-        // Параметры окружающего освещения
-        ImGui::ColorEdit3("Ambient light", &m_ambientColor.x); //Окружающий цвет
-
-        // Параметры для каждого источника света
-        for (int i = 0; i < m_lightCount; i++)
+        // Секция детализации и PBR
+        if (ImGui::CollapsingHeader("Details & PBR", ImGuiTreeNodeFlags_DefaultOpen))
         {
-            ImGui::PushID(i);
-            ImGui::Text("Light %d", i); //Источник
-            char posLabel[32];
-            sprintf_s(posLabel, "Pos %d", i); //Позиция
-            ImGui::DragFloat3(posLabel, &m_lights[i].pos.x, 0.1f, -10.0f, 10.0f);
-            char colorLabel[32];
-            sprintf_s(colorLabel, "Color %d", i); //Цвет
-            ImGui::ColorEdit3(colorLabel, &m_lights[i].color.x);
-            ImGui::PopID();
+            // ImGui::SliderFloat("Detail Strength", &m_detailStrength, 0.0f, 1.5f, "%.2f");
+            const char* flowModes[] = { u8"Обычный", u8"Влажные ущелья", u8"Каменистое дно каньона", u8"Горные ручьи" };
+            ImGui::Combo("Flow Mode", &m_flowModeIndex, flowModes, IM_ARRAYSIZE(flowModes));
+
+            /*
+            if (ImGui::Checkbox("Manual Roughness/Metalness", &m_useManualRoughnessMetalness))
+            {
+                // при переключении флага автоматически обновим буфер при следующем кадре
+            }
+
+            if (m_useManualRoughnessMetalness)
+            {
+                ImGui::SliderFloat("Roughness", &m_manualRoughness, 0.0f, 1.0f, "%.3f");
+                ImGui::SliderFloat("Metalness", &m_manualMetalness, 0.0f, 1.0f, "%.3f");
+            }
+            else
+            {
+                ImGui::Text("Using texture values");
+            }
+            */
+            /*
+            if (ImGui::IsItemEdited()) // если значение изменилось
+            {
+                UpdateLightIntensities();
+            }*/
+
+            // Настройки PBR
+            const char* renderModes[] = {
+                "Full Lightning (PBR + IBL)",
+                "Normal Distribution (NDF)",
+                "Geometry Function (G)",
+                "Fresnel Function (F)",
+                "Diffuse Only",
+                "Specular Only",
+                "Diffuse IBL",
+                "Specular IBL",
+                "Fresnel IBL",
+                "BRDF LUT",
+                "Irradiance Map"
+            };
+            ImGui::Combo("Render Mode", &g_renderMode, renderModes, IM_ARRAYSIZE(renderModes));
         }
 
         ImGui::End();
-
-        // Окно постпроцессинга
-        ImGui::Begin("Post Processing", &m_showImGui, ImGuiWindowFlags_AlwaysAutoResize);
-
-        const char* effectNames[] = {
-            "No Effect",     // 0
-            "Sepia",         // 1
-            "Cold Tint",     // 2
-            "Night Vision"   // 3
-        };
-
-        ImGui::Text("Select Post-Process Effect:");
-        ImGui::Combo("Effect", &m_postProcessEffect, effectNames, IM_ARRAYSIZE(effectNames));
-
-        // Отображение текущего выбранного эффекта
-        ImGui::Text("Current Effect:");
-        ImGui::SameLine();
-        switch (m_postProcessEffect)
-        {
-        case 0: ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "None"); break;
-        case 1: ImGui::TextColored(ImVec4(0.8f, 0.6f, 0.2f, 1.0f), "Sepia"); break;
-        case 2: ImGui::TextColored(ImVec4(0.2f, 0.6f, 1.0f, 1.0f), "Cold Tint"); break;
-        case 3: ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.3f, 1.0f), "Night Vision"); break;
-        }
-
-        ImGui::End();
-
-        // Окно настройки детализации
-        ImGui::Begin("Detail&PBR Settings", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
-        //ImGui::SliderFloat("Detail Strength", &m_detailStrength, 0.0f, 1.5f, "%.2f");
-        ImGui::Checkbox("Flow Mode", &m_flowMode);
-        if (ImGui::IsItemEdited()) // если значение изменилось
-        {
-            UpdateLightIntensities();
-        }
-        // Настройки PBR
-        const char* renderModes[] = {
-            "Lighting (PBR)",
-            "Normal Distribution (NDF)",
-            "Geometry Function (G)",
-            "Fresnel Function (F)",
-            "Diffuse Only",
-            "Specular Only"
-        };
-        ImGui::Combo("Render Mode", &g_renderMode, renderModes, IM_ARRAYSIZE(renderModes));
-        ImGui::End();
-
-
 
         // Рендеринг ImGui
         ImGui::Render();
@@ -2484,7 +2949,10 @@ void Render()
 
     // Вывод на экран с вертикальной синхронизацией (1 - включена)
     HRESULT result = m_pSwapChain->Present(1, 0);
-    assert(SUCCEEDED(result));
+    if (FAILED(result))
+    {
+        OutputDebugString(L"Present failed\n");
+    }
 }
 
 // Очистка ресурсов
@@ -2521,6 +2989,9 @@ void Cleanup()
     SAFE_RELEASE(m_pColorBufferRTV);
     SAFE_RELEASE(m_pColorBuffer);
 
+    // Освобождаем IBL ресурсы
+    g_ibl.Shutdown();
+
     // Завершаем работу ImGui
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
@@ -2531,13 +3002,17 @@ void Cleanup()
 
     // Освобождаем состояния глубины
     SAFE_RELEASE(m_pNormalDepthState);
-
+    SAFE_RELEASE(m_pSkyboxDepthState);
 
     SAFE_RELEASE(m_pSampler);
+    SAFE_RELEASE(g_pSkyboxSampler);
+    SAFE_RELEASE(g_pLinearSampler);
+    SAFE_RELEASE(g_pLinearMipSampler);
     SAFE_RELEASE(m_pTextureView);
     SAFE_RELEASE(m_pTexture);
 
     SAFE_RELEASE(m_pRasterizerState);
+    SAFE_RELEASE(m_pRasterizerCullFront);
     SAFE_RELEASE(m_pDepthStencilView);
     SAFE_RELEASE(m_pDepthBuffer);
 
@@ -2555,6 +3030,14 @@ void Cleanup()
     SAFE_RELEASE(m_pSwapChain);
     SAFE_RELEASE(m_pDeviceContext);
     SAFE_RELEASE(m_pDevice);
+
+    // Освобождаем ресурсы скайбокса
+    SAFE_RELEASE(g_pSkyboxVS);
+    SAFE_RELEASE(g_pSkyboxPS);
+    SAFE_RELEASE(g_pSkyboxInputLayout);
+    SAFE_RELEASE(g_pSkyboxVertexBuffer);
+    SAFE_RELEASE(g_pSkyboxIndexBuffer);
+    SAFE_RELEASE(g_pSkyboxConstantBuffer);
 
     // Завершаем COM
     CoUninitialize();

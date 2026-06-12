@@ -33,12 +33,24 @@ float G_Smith(float NdotV, float NdotL, float roughness)
     return G_SchlickGGX(NdotV, roughness) * G_SchlickGGX(NdotL, roughness);
 }
 
-// Fresnel-Schlick
+// Fresnel-Schlick (используется для точечных и направленных источников)
 // Формула: F = F0 + (1 - F0) * (1 - V·H)^5
 // F0 – базовое отражение при перпендикулярном взгляде
 float3 F_Schlick(float3 F0, float VdotH)
 {
     return F0 + (1.0 - F0) * pow(1.0 - VdotH, 5.0);
+}
+
+// Fresnel-Schlick (используется для IBL с учётом шероховатости)
+// Аппроксимация для IBL: 
+//   - вместо (1 - F0) используется (max(1 - roughness, F0) - F0)
+//   - вместо V·H используется N·V
+// Формула: F = F0 + ( max(1 - roughness, F0) - F0 ) * (1 - cosTheta)^5
+float3 FresnelSchlickRoughness(float3 F0, float roughness, float3 V, float3 N)
+{
+    float cosTheta = max(dot(V, N), 0.0); // косинус угла между направлением взгляда (V) и нормалью (N)
+    float3 F = F0 + (max(float3(1.0 - roughness, 1.0 - roughness, 1.0 - roughness), F0) - F0) * pow(1.0 - cosTheta, 5.0);
+    return F;
 }
 
 // Вспомогательная функция для получения F0 из параметров материала

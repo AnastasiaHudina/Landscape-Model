@@ -63,12 +63,14 @@ float4 main(VSOutput pixel) : SV_Target0
     //roughness = roughnessTexture.Sample(colorSampler, pixel.uv).r; // берём красный канал
 
     //roughness = 1.0 - roughnessTexture.Sample(colorSampler, pixel.uv).g; // берём зелёный канал
+    
     roughness = 1.0 - roughnessTexture.Sample(colorSampler, pixel.uv).r; // инвертируем!!
 
     //roughness = pow(roughness, 0.3); // делает значения ближе к 1
     //roughness = max(roughness, 0.5);  // Ограничиваем минимальное значение roughness - применяем минимальный roughness для гладких участков, чтобы не было слишком зеркальных поверхностей
 
-    roughness = clamp(roughness, 0.08, 1.0); // предотвращаем деление на ноль
+    //roughness = clamp(roughness, 0.08, 1.0); // предотвращаем деление на ноль
+    roughness = clamp(roughness * 0.5f, 0.05f, 1.0f);
     metalness = 0.0; // пока константа, позже можно из текстуры
 
 
@@ -115,6 +117,7 @@ float4 main(VSOutput pixel) : SV_Target0
 
     // БЛОК FLOW 
     float occlusionFactor = 1.0f;
+    float specularIblFactor = 1.0f;
     int flowMode = (int)flowInfo.x;
     if (flowMode > 0)
     {
@@ -128,18 +131,21 @@ float4 main(VSOutput pixel) : SV_Target0
         // Применяем эффект в зависимости от выбранного режима
         if (flowMode == 1) // ВЛАЖНЫЕ УЩЕЛЬЯ (Мокрый, потемневший камень в низинах)
         {
-            // Слегка сужаем маску влажности (степень 2.0), чтобы мокрый камень не вылезал на вершины холмов
-            float wetMask = pow(flowMask, 2.0f);
+            // Слегка сужаем маску влажности (степень 2.5), чтобы мокрый камень не вылезал на вершины холмов
+            float wetMask = pow(flowMask, 2.5f);
 
             // Земля и камень сильно темнеют от влаги
-            float3 wetAlbedo = albedo * 0.40f;
+            float3 wetAlbedo = albedo * float3(0.35f, 0.35f, 0.45f);
             albedo = lerp(albedo, wetAlbedo, wetMask);
 
             // Плавно переходим от текстурного roughness скал к влажному гладкому камню (0.25)
-            roughness = lerp(roughness, 0.25f, wetMask);
+            roughness = lerp(roughness, 0.15f, wetMask);
 
             // Слегка приподнимаем F0 до 0.08 для характерного маслянистого блеска мокрой породы
             dielectricF0 = lerp(dielectricF0, 0.08f, wetMask);
+
+            // Гасим Specular IBL во влажных низинах, чтобы убрать белесую пелену
+            specularIblFactor = lerp(1.0f, 0.30f, wetMask);
         }
         else if (flowMode == 2) // КАМЕНИСТОЕ ДНО КАНЬОНА (Глубокие, сухие, матовые расщелины)
         {
@@ -152,6 +158,10 @@ float4 main(VSOutput pixel) : SV_Target0
 
             // Оставляем стандартный диэлектрик земли (4%)
             dielectricF0 = 0.04f;
+
+            // Перезаписываем occlusionFactor и specularIblFactor, чтобы каньон ушел в глубокую темноту
+            occlusionFactor = lerp(1.0f, 0.15f, flowMask);
+            specularIblFactor = lerp(1.0f, 0.05f, flowMask);
         }
         else if (flowMode == 3) // ГОРНЫЕ РУЧЬИ (Тонкие зеркальные жилы чистой воды)
         {
@@ -168,6 +178,10 @@ float4 main(VSOutput pixel) : SV_Target0
             // Возвращаем физически честное значение чистой воды (0.02). 
             // Убираем ртутный блеск - теперь вода засияет только под правильным углом к Луне (Френель)
             dielectricF0 = lerp(dielectricF0, 0.02f, waterMask);
+
+            // Не даем ночному небу превратить ручьи в серые светящиеся провода
+            occlusionFactor = lerp(1.0f, 0.20f, waterMask);
+            specularIblFactor = lerp(1.0f, 0.10f, waterMask);
         }
     }
 
@@ -217,22 +231,44 @@ float4 main(VSOutput pixel) : SV_Target0
     
     // ПРИМЕНЯЕМ ФИЗИЧЕСКОЕ ЗАТЕНЕНИЕ К СВЕТУ НЕБА (через FLOW)
     diffuseIBL *= occlusionFactor;  // Ambient Occlusion
-    specularIBL *= occlusionFactor; // Specular Occlusion
+    specularIBL *= specularIblFactor; // Specular Occlusion
 
     // Ночь
     // Снижаем общую яркость ночного неба в 3-4 раза
     // Коэффициент 0.25f – 0.35f вернет в сцену глубокую ночную темноту
-    //diffuseIBL *= 0.25f;
-    //specularIBL *= 0.25f;
+    //diffuseIBL *= 0.02f;
+    //specularIBL *= 0.02f;
+
+    // Ночь: убираем ровную паразитную засветку, но сохраняем микроблики
+    diffuseIBL *= 0.03f; // Практически уводит тени в темноту
+    specularIBL *= 0.12f; // Оставляет легкий отраженный свет на материале
 
     float3 ambientIBL = diffuseIBL + specularIBL;
 
     color += ambientIBL;
 
+    
 
-
+    
     // Один направленный свет
     float3 L_dir = normalize(-dirLightDir.xyz); // направление от поверхности к источнику
+    //float3 L_dir = normalize(float3(1.0, 0.2, 0.0)); // почти сбоку, чуть сверху
+    
+    /*
+    float3 originalDir = normalize(dirLightDir.xyz);
+    float tiltAngle = radians(45.0); // 45 градусов от вертикали
+    // Поворачиваем вокруг оси X (наклон в сторону +Z или -Z)
+    float cosT = cos(tiltAngle);
+    float sinT = sin(tiltAngle);
+    float3x3 rotX = {
+        1, 0, 0,
+        0, cosT, -sinT,
+        0, sinT, cosT
+    };
+    float3 tiltedDir = mul(originalDir, rotX);
+    float3 L_dir = normalize(tiltedDir);
+    */
+
     float NdotL_dir = max(dot(N, L_dir), 0.0);
     float3 radiance_dir = dirLightColor.rgb * dirLightColor.w;
     float3 H_dir = normalize(V + L_dir);
@@ -324,9 +360,9 @@ float4 main(VSOutput pixel) : SV_Target0
 
     // Иначе (renderMode == 0) – обычный PBR
     // Гамма-коррекция
-    //color = color / (color + 1.0);
-    color = saturate(color);
-    //color = pow(color, 1.0 / 2.2);
+    color = color / (color + 1.0);
+    //color = saturate(color);
+    color = pow(color, 1.0 / 2.2);
     
     return float4(color, 1.0);
 }

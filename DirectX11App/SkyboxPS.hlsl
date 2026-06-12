@@ -15,6 +15,9 @@ float4 main(PS_INPUT input) : SV_TARGET
 
     float3 color = skyboxTexture.Sample(skyboxSampler, dir).rgb;
 
+    // Ночное затухание неба (обычно 0.15..0.3)
+    color *= 0.2f;
+
     return float4(color, 1.0f);
 }
 

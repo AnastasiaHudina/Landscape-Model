@@ -2438,7 +2438,8 @@ void UpdateCamera()
     DirectX::XMFLOAT3 sunDir = g_ibl.GetSunDirection();
     sceneBuffer.dirLightDir = DirectX::XMFLOAT4(sunDir.x, sunDir.y, sunDir.z, 0.0f);
     // Интенсивность и цвет подберите под свою сцену (для луны – холодный, яркость 1.5..2.0)
-    sceneBuffer.dirLightColor = DirectX::XMFLOAT4(0.9f, 0.95f, 1.0f, 1.5f);
+    sceneBuffer.dirLightColor = DirectX::XMFLOAT4(0.40f, 0.55f, 1.0f, 4.0f);
+    
 
     // ручное управление шероховатостью/металличностью
     //sceneBuffer.manualPBRParams.x = m_useManualRoughnessMetalness ? 1.0f : 0.0f;

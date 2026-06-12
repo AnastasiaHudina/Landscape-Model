@@ -109,4 +109,9 @@
   <ItemGroup>
     <None Include="packages.config" />
   </ItemGroup>
+  <ItemGroup>
+    <FxCompile Include="PBR.hlsl" />
+    <FxCompile Include="TerrainVS.hlsl" />
+    <FxCompile Include="TerrainPS.hlsl" />
+  </ItemGroup>
 </Project>

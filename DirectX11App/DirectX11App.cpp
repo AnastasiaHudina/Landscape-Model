@@ -1,9 +1,9 @@
 ﻿// === ПОЯСНЕНИЕ К УПРАВЛЕНИЮ ===
 //На мышь - приближать/отдалять
-//Правая кнопка мыши - вращение камерой на месте
+//Левая кнопка мыши - вращение камерой при полёте
 //Клавиши wasd - перемещение камеры 
 //Клавиши q/e - изменение высоты над поверхностью
-//Левая кнопка мыши - вращение камерой при полёте
+//
 
 // Standard Windows Headers
 #include <windows.h>
@@ -56,7 +56,7 @@ struct GeomBuffer
 {
     DirectX::XMFLOAT4X4 m;
     DirectX::XMFLOAT4X4 normalM;
-    DirectX::XMFLOAT4 shineSpeedTexIdNM;
+    DirectX::XMFLOAT4 pbrParams; // x - roughness, y - metalness, z - unused, w - hasNormalMap
     DirectX::XMFLOAT4 posAngle;
 };
 
@@ -69,6 +69,7 @@ struct SceneBuffer
     Light lights[10];                        // массив источников света (до 10)
     DirectX::XMFLOAT4 ambientColor;          // цвет фонового (ambient) освещения
     DirectX::XMFLOAT4 flowInfo;               // x - использовать Flow 
+    DirectX::XMFLOAT4 renderModeInfo; // x - renderMode, yzw - не используются (padding)
 };
 
 // Буфер для постпроцессинга
@@ -97,6 +98,7 @@ bool LoadTexture();
 bool LoadNormalMap();
 bool LoadDetailTexture();
 bool LoadFlowTexture();
+bool LoadRoughnessTexture();
 bool InitSmallSpheres();
 void UpdateLightIntensities();
 void Render();
@@ -132,7 +134,12 @@ ID3D11ShaderResourceView* m_pDetailTextureView = nullptr; // шейдерное 
 
 // === ПЕРЕМЕННЫЕ ДЛЯ ТЕКСТУРЫ FLOW ===
 ID3D11ShaderResourceView* m_pFlowTextureView = nullptr;
-bool m_flowMode = false;   // false - режим без Flow, true - с Flow
+bool m_flowMode = true;   // false - режим без Flow, true - с Flow
+
+// === ПЕРЕМЕННЫЕ ДЛЯ ТЕКСТУР PBR ===
+ID3D11ShaderResourceView* m_pRoughnessTextureView = nullptr; // шейдерное представление карты шероховатости
+ID3D11ShaderResourceView* m_pMetalnessTextureView = nullptr; // шейдерное представление карты металличности (пока константно)
+int g_renderMode = 0;           // 0 - обычный PBR, 1 - NDF, 2 - Geometry, 3 - Fresnel и т.д.
 
 // === ПЕРЕМЕННЫЕ ДЛЯ ПОСТПРОЦЕССИНГА ===
 ID3D11Texture2D* m_pColorBuffer = nullptr;           // текстура для промежуточного рендера (цвет)
@@ -241,162 +248,6 @@ struct TextureTangentVertex
 bool InitShaders()
 {
     HRESULT result = S_OK;
-
-    // Вершинный шейдер
-    const char* vsSource = R"(
-    cbuffer GeomBuffer : register(b0)
-    {
-        float4x4 m;
-        float4x4 normalM;
-        float4 shineSpeedTexIdNM; // x - shine, z - texId, w - hasNormalMap
-        float4 posAngle; // не используется
-    };
-    
-    cbuffer SceneBuffer : register(b1)
-    {
-        float4x4 vp;
-        float4 cameraPos;
-        float4 lightInfo; // x - light count, y - use normal maps, z - show normals, w - unused
-        struct Light { float4 pos; float4 color; float intensity; float3 padding; };
-        Light lights[10];
-        float4 ambientColor;
-        float4 flowInfo;   // x - использовать Flow
-    };
-
-    struct VSInput
-    {
-        float3 pos : POSITION;
-        float3 tangent : TANGENT;
-        float3 norm : NORMAL;
-        float2 uv : TEXCOORD;
-    };
-
-    struct VSOutput
-    {
-        float4 pos : SV_POSITION;
-        float3 worldPos : POSITION;
-        float3 tangent : TANGENT;
-        float3 norm : NORMAL;
-        float2 uv : TEXCOORD;
-        nointerpolation float4 geomData : GEOM_DATA; // передадим shine и texId
-    };
-
-    VSOutput main(VSInput vertex)
-    {
-        VSOutput result;
-        float4 worldPos = mul(float4(vertex.pos, 1.0), m);
-        result.pos = mul(worldPos, vp);
-        result.worldPos = worldPos.xyz;
-        
-        result.tangent = mul(float4(vertex.tangent, 0.0f), normalM).xyz;
-        result.norm = mul(float4(vertex.norm, 0.0f), normalM).xyz;
-        result.uv = vertex.uv;
-        result.geomData = shineSpeedTexIdNM;
-        return result;
-    }
-)";
-
-    const char* psSource = R"(
-    Texture2D colorTexture : register(t0);
-    Texture2D normalMapTexture : register(t1);
-    Texture2D detailTexture : register(t2);   // текстура деталей
-    Texture2D flowTexture : register(t3);     // текстура потока (flow)
-    SamplerState colorSampler : register(s0);
-
-    cbuffer SceneBuffer : register(b1)
-    {
-        float4x4 vp;
-        float4 cameraPos;
-        float4 lightInfo; // x - light count, y - use normal maps, z - show normals, w - detail strength
-        struct Light { float4 pos; float4 color; float intensity; float3 padding; };
-        Light lights[10];
-        float4 ambientColor;
-        float4 flowInfo;   // x - использовать Flow
-    };
-
-    struct VSOutput
-    {
-        float4 pos : SV_POSITION;
-        float3 worldPos : POSITION;
-        float3 tangent : TANGENT;
-        float3 norm : NORMAL;
-        float2 uv : TEXCOORD;
-        nointerpolation float4 geomData : GEOM_DATA; // x=shine, w=hasNormalMap
-    };
-
-    float3 CalculateLighting(float3 objColor, float3 objNormal, float3 pos, float shine)
-    {
-        float3 finalColor = float3(0, 0, 0);
-        
-        if (lightInfo.z > 0.5)
-        {
-            return objNormal * 0.5 + float3(0.5, 0.5, 0.5);
-        }
-        
-        finalColor = objColor * ambientColor.rgb;
-        
-        for (int i = 0; i < (int)lightInfo.x; i++)
-        {
-            float3 lightDir = lights[i].pos.xyz - pos;
-            float lightDist = length(lightDir);
-            lightDir /= lightDist;
-            
-            float atten = 1.0 / (lightDist * lightDist);
-            atten = clamp(atten, 0.0, 1.0);
-            
-            float3 lightColor = lights[i].color.rgb * lights[i].intensity;
-            float diffuse = max(dot(lightDir, objNormal), 0.0);
-            finalColor += objColor * diffuse * atten * lightColor;
-            
-            if (shine > 0.0)
-            {
-                float3 viewDir = normalize(cameraPos.xyz - pos);
-                float3 reflectDir = reflect(-lightDir, objNormal);
-                float specular = pow(max(dot(viewDir, reflectDir), 0.0), shine);
-                finalColor += objColor * 0.5 * specular * atten * lightColor;
-            }
-        }
-        
-        return finalColor;
-    }
-
-    float4 main(VSOutput pixel) : SV_Target0
-    {
-        float3 color = colorTexture.Sample(colorSampler, pixel.uv).rgb;
-        
-        // Наложение детали с регулируемой силой
-        float detail = detailTexture.Sample(colorSampler, pixel.uv).r;
-        float detailStrength = lightInfo.w;
-        // Мягкое наложение: цвет изменяется в пределах ± detailStrength * 0.5
-        color = color * (1.0 + (detail - 0.5) * detailStrength);
-        
-        float3 normal = normalize(pixel.norm);
-        
-        if (lightInfo.y > 0.5 && pixel.geomData.w > 0.5)
-        {
-            float3 texNormal = normalMapTexture.Sample(colorSampler, pixel.uv).rgb;
-            texNormal = texNormal * 2.0 - 1.0;
-            
-            float3 bitangent = normalize(cross(pixel.tangent, pixel.norm));
-            float3x3 TBN = float3x3(pixel.tangent, bitangent, pixel.norm);
-            normal = normalize(mul(texNormal, TBN));
-        }
-        
-            float3 finalColor = CalculateLighting(color, normal, pixel.worldPos, pixel.geomData.x);
-    
-    // Применяем Flow только если включён режим
-    if (flowInfo.x > 0.5)
-    {
-        float3 flowColor = flowTexture.Sample(colorSampler, pixel.uv).rgb;
-        float flowLuminance = dot(flowColor, float3(0.299f, 0.587f, 0.114f));
-        // Ваш вариант 2: затемнение в светлых областях
-        finalColor *= (1.0f - flowLuminance);
-    }
-    
-    return float4(finalColor, 1.0);
-}
-)";
-
     ID3DBlob* pVSBlob = nullptr;
     ID3DBlob* pPSBlob = nullptr;
     ID3DBlob* pErrorBlob = nullptr;
@@ -406,15 +257,14 @@ bool InitShaders()
     flags |= D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
 #endif
 
-    // Компиляция вершинного шейдера
-    result = D3DCompile(vsSource, strlen(vsSource), "VS", nullptr, nullptr, "main", "vs_5_0", flags, 0, &pVSBlob, &pErrorBlob);
+    // Компиляция вершинного шейдера из файла
+    result = D3DCompileFromFile(L"TerrainVS.hlsl", nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE, "main", "vs_5_0", flags, 0, &pVSBlob, &pErrorBlob);
     if (FAILED(result))
     {
-        if (pErrorBlob) { OutputDebugStringA((const char*)pErrorBlob->GetBufferPointer()); pErrorBlob->Release(); }
+        if (pErrorBlob) OutputDebugStringA((const char*)pErrorBlob->GetBufferPointer());
         return false;
     }
 
-    // Создание вершинного шейдера
     result = m_pDevice->CreateVertexShader(pVSBlob->GetBufferPointer(), pVSBlob->GetBufferSize(), nullptr, &m_pVertexShader);
     if (FAILED(result))
     {
@@ -422,16 +272,15 @@ bool InitShaders()
         return false;
     }
 
-    // Компиляция пиксельного шейдера
-    result = D3DCompile(psSource, strlen(psSource), "PS", nullptr, nullptr, "main", "ps_5_0", flags, 0, &pPSBlob, &pErrorBlob);
+    // Компиляция пиксельного шейдера из файла
+    result = D3DCompileFromFile(L"TerrainPS.hlsl", nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE, "main", "ps_5_0", flags, 0, &pPSBlob, &pErrorBlob);
     if (FAILED(result))
     {
-        if (pErrorBlob) { OutputDebugStringA((const char*)pErrorBlob->GetBufferPointer()); pErrorBlob->Release(); }
+        if (pErrorBlob) OutputDebugStringA((const char*)pErrorBlob->GetBufferPointer());
         pVSBlob->Release();
         return false;
     }
 
-    // Создание пиксельного шейдера
     result = m_pDevice->CreatePixelShader(pPSBlob->GetBufferPointer(), pPSBlob->GetBufferSize(), nullptr, &m_pPixelShader);
     if (FAILED(result))
     {
@@ -440,7 +289,7 @@ bool InitShaders()
         return false;
     }
 
-    // Описание входных данных вершин (позиция, касательная, нормаль, текстурные координаты)
+    // Создание input layout (остаётся без изменений)
     static const D3D11_INPUT_ELEMENT_DESC InputDesc[] = {
         { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0 },
         { "TANGENT", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0 },
@@ -448,7 +297,6 @@ bool InitShaders()
         { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 36, D3D11_INPUT_PER_VERTEX_DATA, 0 }
     };
 
-    // Создание layout'а для соответствия данным вершин и входу шейдера
     result = m_pDevice->CreateInputLayout(InputDesc, 4,
         pVSBlob->GetBufferPointer(), pVSBlob->GetBufferSize(), &m_pInputLayout);
 
@@ -522,8 +370,18 @@ bool LoadTexture()
 
     // Описание текстуры 2D
     D3D11_TEXTURE2D_DESC desc = {};
-    desc.Format = textureDesc.fmt;                     // DXGI_FORMAT_R8G8B8A8_UNORM
     desc.ArraySize = 1;
+    // Для альбедо используем sRGB-формат, если он поддерживается
+    DXGI_FORMAT sRGBFormat = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    if (SUCCEEDED(m_pDevice->CheckFormatSupport(sRGBFormat, &formatSupport)) &&
+        (formatSupport & D3D11_FORMAT_SUPPORT_TEXTURE2D))
+    {
+        desc.Format = sRGBFormat;
+    }
+    else
+    {
+        desc.Format = textureDesc.fmt; // fallback на линейный
+    }
     desc.MipLevels = textureDesc.mipmapsCount;          // сколько mip-уровней загружено
     desc.Usage = D3D11_USAGE_IMMUTABLE;                 // неизменяемая (после загрузки)
     desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;        // для использования в шейдерах
@@ -805,6 +663,81 @@ bool LoadFlowTexture()
 
     result = m_pDevice->CreateShaderResourceView(pFlowTexture, &srvDesc, &m_pFlowTextureView);
     pFlowTexture->Release(); // теперь управляет SRV
+    if (FAILED(result))
+        return false;
+
+    return true;
+}
+
+// Загрузка текстуры шероховатости (roughness) из PNG
+bool LoadRoughnessTexture()
+{
+    HRESULT result = S_OK;
+
+    TextureDesc textureDesc;
+    if (!LoadPNG(L"landscape/Terrain003_4K_Flow.png", textureDesc))   // имя файла
+        return false;
+
+    // Проверка поддержки формата (линейный RGBA)
+    UINT formatSupport = 0;
+    if (FAILED(m_pDevice->CheckFormatSupport(textureDesc.fmt, &formatSupport)) ||
+        !(formatSupport & D3D11_FORMAT_SUPPORT_TEXTURE2D))
+    {
+        free(textureDesc.pData);
+        return false;
+    }
+
+    D3D11_TEXTURE2D_DESC desc = {};
+    desc.Format = textureDesc.fmt;                     // DXGI_FORMAT_R8G8B8A8_UNORM
+    desc.ArraySize = 1;
+    desc.MipLevels = textureDesc.mipmapsCount;
+    desc.Usage = D3D11_USAGE_IMMUTABLE;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    desc.CPUAccessFlags = 0;
+    desc.MiscFlags = 0;
+    desc.SampleDesc.Count = 1;
+    desc.SampleDesc.Quality = 0;
+    desc.Height = textureDesc.height;
+    desc.Width = textureDesc.width;
+
+    // Подготовка массива субресурсов (все MIP-уровни)
+    std::vector<D3D11_SUBRESOURCE_DATA> data(desc.MipLevels);
+    const BYTE* pSrcData = reinterpret_cast<const BYTE*>(textureDesc.pData);
+    UINT w = textureDesc.width;
+    UINT h = textureDesc.height;
+
+    for (UINT i = 0; i < desc.MipLevels; i++)
+    {
+        UINT pitch = w * 4;   // 4 байта на пиксель (RGBA)
+        UINT levelSize = pitch * h;
+
+        data[i].pSysMem = pSrcData;
+        data[i].SysMemPitch = pitch;
+        data[i].SysMemSlicePitch = 0;
+
+        pSrcData += levelSize;
+        w = std::max(1u, w / 2);
+        h = std::max(1u, h / 2);
+    }
+
+    ID3D11Texture2D* pRoughnessTexture = nullptr;
+    result = m_pDevice->CreateTexture2D(&desc, data.data(), &pRoughnessTexture);
+    free(textureDesc.pData);
+    if (FAILED(result))
+    {
+        OutputDebugString(L"LoadRoughnessTexture: Failed to create texture\n");
+        return false;
+    }
+
+    // Создание шейдерного представления (SRV)
+    D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+    srvDesc.Format = desc.Format;
+    srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    srvDesc.Texture2D.MipLevels = desc.MipLevels;
+    srvDesc.Texture2D.MostDetailedMip = 0;
+
+    result = m_pDevice->CreateShaderResourceView(pRoughnessTexture, &srvDesc, &m_pRoughnessTextureView);
+    pRoughnessTexture->Release(); // теперь управляет SRV
     if (FAILED(result))
         return false;
 
@@ -1347,6 +1280,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     if (!LoadFlowTexture())
     {
         MessageBox(NULL, L"Не удалось загрузить текстуру Flow!", L"Ошибка", MB_OK);
+        Cleanup();
+        return -1;
+    }
+
+    // Загружаем текстуру шероховатости (roughness)
+    if (!LoadRoughnessTexture())
+    {
+        MessageBox(NULL, L"Не удалось загрузить текстуру шероховатости!", L"Ошибка", MB_OK);
         Cleanup();
         return -1;
     }
@@ -2002,19 +1943,31 @@ bool InitTerrain()
     // 7. Константный буфер для геометрии ландшафта
     D3D11_BUFFER_DESC geomBufferDesc = {};
     geomBufferDesc.ByteWidth = sizeof(GeomBuffer);
-    geomBufferDesc.Usage = D3D11_USAGE_DEFAULT;
+    geomBufferDesc.Usage = D3D11_USAGE_DYNAMIC;
     geomBufferDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    geomBufferDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    geomBufferDesc.MiscFlags = 0;
+    geomBufferDesc.StructureByteStride = 0;
 
     GeomBuffer geomData;
     DirectX::XMMATRIX model = DirectX::XMMatrixIdentity();  // ландшафт в центре
     DirectX::XMStoreFloat4x4(&geomData.m, DirectX::XMMatrixTranspose(model));
     DirectX::XMStoreFloat4x4(&geomData.normalM, DirectX::XMMatrixIdentity()); // обратная транспонированная  = единичная
-    geomData.shineSpeedTexIdNM = DirectX::XMFLOAT4(0.0f, 0.0f, 0.0f, 1.0f); // shine=0, texId=0, hasNormalMap=1
+    geomData.pbrParams = DirectX::XMFLOAT4(0.5f, 0.0f, 0.0f, 1.0f); // hasNormalMap = 1
     geomData.posAngle = DirectX::XMFLOAT4(0, 0, 0, 0);
 
+    // Создаём буфер без начальных данных
     D3D11_SUBRESOURCE_DATA geomInitData = { &geomData, 0, 0 };
     result = m_pDevice->CreateBuffer(&geomBufferDesc, &geomInitData, &m_pTerrainGeomBuffer);
     if (FAILED(result)) return false;
+
+    // Заполняем буфер через Map/Unmap
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    if (SUCCEEDED(m_pDeviceContext->Map(m_pTerrainGeomBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+    {
+        memcpy(mapped.pData, &geomData, sizeof(GeomBuffer));
+        m_pDeviceContext->Unmap(m_pTerrainGeomBuffer, 0);
+    }
 
     return true;
 }
@@ -2155,7 +2108,11 @@ void UpdateCamera()
         sceneBuffer.lights[i] = m_lights[i];
 
     sceneBuffer.ambientColor = m_ambientColor;
-    sceneBuffer.flowInfo = DirectX::XMFLOAT4(m_flowMode ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f);
+    float flowStrength = 0.0f; // например, 0.5 – половина силы
+    sceneBuffer.flowInfo = DirectX::XMFLOAT4(m_flowMode ? 1.0f : 0.0f, flowStrength, 0.0f, 0.0f);
+    //sceneBuffer.flowInfo = DirectX::XMFLOAT4(m_flowMode ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f);
+
+    sceneBuffer.renderModeInfo = DirectX::XMFLOAT4((float)g_renderMode, 0.0f, 0.0f, 0.0f);
 
     // Обновление буфера
     D3D11_MAPPED_SUBRESOURCE mapped;
@@ -2377,14 +2334,21 @@ void Render()
     // Обновление константных буферов (камера и постпроцессинг)
     UpdateCamera();
     UpdatePostProcessBuffer();
-
+   
     // 1. РЕНДЕРИМ ЛАНДШАФТ
     m_pDeviceContext->OMSetDepthStencilState(m_pNormalDepthState, 0);
     m_pDeviceContext->OMSetBlendState(m_pOpaqueBlendState, nullptr, 0xFFFFFFFF);
 
-    // Устанавливаем текстуры: основную, карту нормалей, детали
-    ID3D11ShaderResourceView* terrainResources[] = { m_pTextureView, m_pTextureViewNM, m_pDetailTextureView, m_pFlowTextureView };
-    m_pDeviceContext->PSSetShaderResources(0, 4, terrainResources);
+    // Устанавливаем текстуры: основную, карту нормалей, детали, flow, roughness, metalness
+    ID3D11ShaderResourceView* terrainResources[] = {
+        m_pTextureView,
+        m_pTextureViewNM,
+        m_pDetailTextureView,
+        m_pFlowTextureView,
+        m_pRoughnessTextureView,
+        m_pMetalnessTextureView  // пока nullptr, но слот зарезервирован
+    };
+    m_pDeviceContext->PSSetShaderResources(0, 6, terrainResources);
 
     // Настраиваем пайплайн
     ID3D11Buffer* vertexBuffers[] = { m_pTerrainVertexBuffer };
@@ -2492,14 +2456,26 @@ void Render()
         ImGui::End();
 
         // Окно настройки детализации
-        ImGui::Begin("Detail Settings", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
-        ImGui::SliderFloat("Detail Strength", &m_detailStrength, 0.0f, 1.5f, "%.2f");
+        ImGui::Begin("Detail&PBR Settings", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
+        //ImGui::SliderFloat("Detail Strength", &m_detailStrength, 0.0f, 1.5f, "%.2f");
         ImGui::Checkbox("Flow Mode", &m_flowMode);
         if (ImGui::IsItemEdited()) // если значение изменилось
         {
             UpdateLightIntensities();
         }
+        // Настройки PBR
+        const char* renderModes[] = {
+            "Lighting (PBR)",
+            "Normal Distribution (NDF)",
+            "Geometry Function (G)",
+            "Fresnel Function (F)",
+            "Diffuse Only",
+            "Specular Only"
+        };
+        ImGui::Combo("Render Mode", &g_renderMode, renderModes, IM_ARRAYSIZE(renderModes));
         ImGui::End();
+
+
 
         // Рендеринг ImGui
         ImGui::Render();
@@ -2532,6 +2508,10 @@ void Cleanup()
     // Освобождаем ресурсы детализации
     SAFE_RELEASE(m_pDetailTextureView);
     SAFE_RELEASE(m_pFlowTextureView);
+
+    //Освобождаем ресурсы карт PBR
+    SAFE_RELEASE(m_pRoughnessTextureView);
+    SAFE_RELEASE(m_pMetalnessTextureView);
 
     // Освобождаем ресурсы постпроцессинга
     SAFE_RELEASE(m_pPostProcessBuffer);
